@@ -47,7 +47,7 @@ if not PPT_PATH.exists():
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "auto").lower()
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "tfidf").lower()
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
 TOP_K = int(os.getenv("TOP_K", "5"))
