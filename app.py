@@ -2,6 +2,7 @@ import os
 import re
 import json
 import pickle
+import base64
 import threading
 import zipfile
 import xml.etree.ElementTree as ET
@@ -323,7 +324,57 @@ def rebuild_index() -> str:
     return f"索引已重建。当前切分片段数：{len(KB.chunks)}；Embedding 后端：{KB.engine.backend}。"
 
 
+def classify_intent(text: str) -> str:
+    messages = [
+        {"role": "system", "content": "你是意图分类器。只返回 gis_tutor、modeling、evaluation、general 之一。gis_tutor 表示 GIS 操作、参数、报错、软件、模型或教材问题；modeling 表示研究问题、选题或可探究性；evaluation 表示评价或打分；其余返回 general。"},
+        {"role": "user", "content": text},
+    ]
+    label = call_llm(messages, temperature=0, max_tokens=10).strip().lower()
+    if label in {"gis_tutor", "modeling", "evaluation", "general"}:
+        return label
+    lowered = text.lower()
+    if any(k in lowered for k in ["评价", "评分", "打分", "探究过程"]):
+        return "evaluation"
+    if any(k in lowered for k in ["我想研究", "研究问题", "选题", "能探究", "可探究"]):
+        return "modeling"
+    if any(k in lowered for k in ["步骤", "操作", "参数", "报错", "模型", "arcgis", "qgis", "envi", "插值", "土地利用"]):
+        return "gis_tutor"
+    return "general"
+
+
+def general_gis_answer(question: str) -> str:
+    answer = call_llm([
+        {"role": "system", "content": SYSTEM_STYLE},
+        {"role": "user", "content": question},
+    ])
+    return answer or f"关于“{question}”，请补充研究对象、数据类型、使用软件和当前步骤，我可以继续给出具体的 GIS 分析或排错建议。"
+
+
+def unified_chat(message: str, history):
+    history = history or []
+    message = (message or "").strip()
+    if not message:
+        return history, ""
+    intent = classify_intent(message)
+    if intent == "modeling":
+        answer = research_question_helper(message)
+    elif intent == "evaluation":
+        answer = process_evaluator(message)
+    elif intent == "gis_tutor":
+        answer, citations = gis_tutor(message)
+        if citations:
+            answer += f"\n\n---\n**教材依据**\n\n{citations}"
+    else:
+        answer = general_gis_answer(message)
+    if not answer:
+        answer = "当前大模型服务暂不可用，请稍后重试。"
+    history.append((message, answer))
+    return history, ""
+
+
 def build_ui():
+    logo_path = APP_DIR / "static" / "cug_logo.png"
+    logo_data = base64.b64encode(logo_path.read_bytes()).decode("ascii") if logo_path.exists() else ""
     css = """
     .gradio-container {max-width: 980px !important; margin: 0 auto !important; background: #f7fbfa;}
     .gm-header {display: flex; align-items: center; gap: 20px; padding: 24px 8px 16px;}
@@ -335,13 +386,12 @@ def build_ui():
     .gm-footer {text-align: center; color: #a0aec0; font-size: 13px; padding: 24px 0 12px; margin-top: 10px;}
     button.primary {background: linear-gradient(135deg, #1a5fa8, #168aad) !important; border: none !important;}
     textarea, input {border-radius: 12px !important;}
-    .tabs {border-radius: 16px !important;}
     """
     theme = gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
     with gr.Blocks(theme=theme, css=css, title="地理探究伴学智能体") as demo:
-        gr.HTML("""
+        gr.HTML(f"""
         <div class="gm-header">
-          <img src="file/static/cug_logo.png" class="gm-logo" alt="CUG Logo">
+          <img src="data:image/png;base64,{logo_data}" class="gm-logo" alt="中国地质大学校徽">
           <div class="gm-title-group">
             <h1 class="gm-main-title">地理探究伴学智能体</h1>
             <p class="gm-sub-title">GeoMentor · 中国地质大学</p>
@@ -349,25 +399,12 @@ def build_ui():
         </div>
         """)
         with gr.Group(elem_classes=["gm-card"]):
-            with gr.Tab("GIS 实验助教"):
-                q = gr.Textbox(label="学生问题", placeholder="", lines=3)
-                ask_btn = gr.Button("生成回答", variant="primary")
-                ans = gr.Markdown(label="回答")
-                with gr.Accordion("教材依据", open=False):
-                    cite = gr.Textbox(label="命中的教材章节", lines=5)
-                ask_btn.click(gis_tutor, inputs=q, outputs=[ans, cite])
-
-            with gr.Tab("问题建模"):
-                rq = gr.Textbox(label="研究问题", placeholder="", lines=3)
-                rq_btn = gr.Button("给出建议", variant="primary")
-                rq_out = gr.Markdown(label="建议")
-                rq_btn.click(research_question_helper, inputs=rq, outputs=rq_out)
-
-            with gr.Tab("过程评价"):
-                proc = gr.Textbox(label="探究过程", placeholder="", lines=6)
-                ev_btn = gr.Button("生成评价", variant="primary")
-                ev_out = gr.Markdown(label="评价结果")
-                ev_btn.click(process_evaluator, inputs=proc, outputs=ev_out)
+            initial_history = [(None, "你好，我是地理探究伴学智能体。你可以直接询问 GIS 实验、研究问题设计、探究过程评价和地理空间分析问题。")]
+            chatbot = gr.Chatbot(value=initial_history, height=560, show_label=False, type="tuples")
+            msg = gr.Textbox(label="输入问题", placeholder="", lines=2)
+            send = gr.Button("发送", variant="primary")
+            send.click(unified_chat, inputs=[msg, chatbot], outputs=[chatbot, msg])
+            msg.submit(unified_chat, inputs=[msg, chatbot], outputs=[chatbot, msg])
         gr.HTML("<div class='gm-footer'>中国地质大学（北京）zcx@cugb.edu.cn</div>")
     return demo
 
