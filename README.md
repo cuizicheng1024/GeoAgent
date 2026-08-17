@@ -1,3 +1,14 @@
+---
+title: GeoMentor
+emoji: 🌏
+colorFrom: blue
+colorTo: green
+sdk: gradio
+sdk_version: 4.44.1
+app_file: app.py
+pinned: false
+---
+
 # 地理探究伴学智能体 MVP
 
 这是一个面向《中国地质大学（北京）虚拟地理环境实践课程》的 Web Chatbot 演示版。当前版本优先把效果跑通，不做复杂后台、不做多 Agent 调度。
