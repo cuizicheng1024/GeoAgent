@@ -47,13 +47,15 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
 TOP_K = int(os.getenv("TOP_K", "5"))
 
-SYSTEM_STYLE = """你是"地理探究伴学智能体"，是 GIS 领域的专家，熟知虚拟地理环境理论与实践、ArcGIS/QGIS/ENVI 等主流 GIS 软件的操作与工作流、地理建模与空间分析方法（含遥感、水文、城市扩张、土地利用、生态模拟等）、常见数据格式与坐标系规范，以及学生在 GIS 实践中遇到的典型认知障碍和操作报错。你具有丰富的实践经验，服务对象是中国地质大学（北京）地理信息科学相关课程学生。
+SYSTEM_STYLE = """你是“地理探究伴学智能体”，也是学生身边一位耐心、靠谱的 GIS 学长和课程助教。你熟悉虚拟地理环境、ArcGIS/QGIS/ENVI、遥感、水文、城市扩张、土地利用、生态模拟、常见数据格式与坐标系，也了解学生做 GIS 实验时容易卡住的地方。
 
-回答要求：
-1. 用中文，表达清楚，先给结论，再给步骤或建议。
-2. 如果依据教材回答，必须优先使用检索到的教材片段，不要编造教材中没有的操作；如教材未涵盖，可结合 GIS 专业知识补充，并明确说明来源。
-3. 遇到不确定信息，要明确说"不确定"，并建议学生回到教材对应章节或向老师确认。
-4. 保持助教风格：具体、可执行、不过度替学生完成思考；遇到报错或卡点时，给出排查思路而不仅仅是答案。"""
+回答时请遵守：
+1. 用自然、亲切的中文交流，像学长在旁边一起排查问题；不要使用公文腔、训诫口吻或“需要向你说明”“请务必”等生硬表达。
+2. 先直接回答学生最关心的问题，再给清楚、可执行的步骤。内容复杂时可以分点，但不要堆砌术语。
+3. 有教材片段时优先依据教材。教材没有覆盖时，可以结合通用 GIS 知识补充，并自然地告诉学生“这部分是通用做法，教材里没有展开”。
+4. 不确定时坦诚说暂时不能确认，并告诉学生可以检查什么、去哪里找答案，不要只让学生“自行确认”。
+5. 遇到报错或卡点，给出由易到难的排查顺序；适当解释为什么这样做，帮助学生真正理解，而不是只给最终答案。
+6. 鼓励学生继续补充数据、软件版本、参数或报错截图，但不要过度客套，也不要替学生完成全部思考。"""
 
 SIX_REAL_FRAMEWORK = """“六真”课程框架：真场景、真数据、真处理、真模拟、真应用、真评价。
 课程目标是以城市扩张、森林火灾、地表水文、城市内涝等真实场景为任务导向，让学生综合运用 GIS、遥感、地理建模与模拟分析能力，完成从问题提出、数据处理、模型模拟到结果解释和评价反思的完整探究过程。"""
@@ -267,6 +269,39 @@ def call_llm(messages: List[Dict], temperature: float = 0.2, max_tokens: int = 2
     return ""
 
 
+def stream_llm(messages: List[Dict], temperature: float = 0.2, max_tokens: int = 2048):
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    try:
+        if deepseek_key:
+            client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
+            stream = client.chat.completions.create(
+                model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+        elif openai_key:
+            client = OpenAI(api_key=openai_key)
+            stream = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+        else:
+            return
+        for chunk in stream:
+            content = chunk.choices[0].delta.content if chunk.choices else None
+            if content:
+                yield content
+    except Exception as error:
+        print(f"流式 LLM 调用失败：{str(error)[:180]}")
+        return
+
+
 def format_context(results: List[Dict]) -> str:
     lines = []
     for i, r in enumerate(results, 1):
@@ -354,22 +389,47 @@ def unified_chat(message: str, history):
     history = history or []
     message = (message or "").strip()
     if not message:
-        return history, ""
+        yield history, ""
+        return
+
     intent = classify_intent(message)
-    if intent == "modeling":
-        answer = research_question_helper(message)
+    citations = ""
+    if intent == "gis_tutor":
+        results = KB.search(message, TOP_K) if ensure_kb() else []
+        context = format_context(results)
+        if results:
+            prompt = f"请基于教材片段回答学生问题。先直接回答，再给可执行步骤和注意事项。\n\n教材片段：\n{context}\n\n学生问题：{message}"
+            citations = "\n\n---\n**教材依据**\n\n" + "\n\n".join(
+                [f"{i}. {r['heading']}（{r['source']}，相关度 {r['score']:.3f}）" for i, r in enumerate(results, 1)]
+            )
+        else:
+            prompt = f"教材知识库暂时没有匹配内容，请用通用 GIS 知识回答，并自然说明教材里没有展开。\n\n学生问题：{message}"
+    elif intent == "modeling":
+        prompt = f"请用六真框架帮助学生把研究想法改成可探究的问题。给出判断、需要补充的信息、2到3个改写示例和下一步行动。\n\n六真框架：{SIX_REAL_FRAMEWORK}\n\n学生想法：{message}"
     elif intent == "evaluation":
-        answer = process_evaluator(message)
-    elif intent == "gis_tutor":
-        answer, citations = gis_tutor(message)
-        if citations:
-            answer += f"\n\n---\n**教材依据**\n\n{citations}"
+        prompt = f"请评价下面的地理探究过程。按问题提出、数据准备、方法选择、结论表达、反思改进五个维度各给0到5分，并给具体改进建议，总分25分。\n\n学生提交：{message}"
     else:
-        answer = general_gis_answer(message)
+        prompt = message
+
+    messages = [
+        {"role": "system", "content": SYSTEM_STYLE},
+        {"role": "user", "content": prompt},
+    ]
+    history.append((message, ""))
+    yield history, ""
+
+    answer = ""
+    for token in stream_llm(messages):
+        answer += token
+        history[-1] = (message, answer)
+        yield history, ""
+
     if not answer:
-        answer = "当前大模型服务暂不可用，请稍后重试。"
-    history.append((message, answer))
-    return history, ""
+        answer = general_gis_answer(message)
+    if citations:
+        answer += citations
+    history[-1] = (message, answer or "当前大模型服务暂不可用，请稍后重试。")
+    yield history, ""
 
 
 def build_ui():
