@@ -232,7 +232,14 @@ class KnowledgeBase:
 
 
 KB = KnowledgeBase()
-KB.build(force=os.getenv("REBUILD_INDEX", "0") == "1")
+KB_AVAILABLE = False
+KB_ERROR = ""
+try:
+    KB.build(force=os.getenv("REBUILD_INDEX", "0") == "1")
+    KB_AVAILABLE = True
+except Exception as error:
+    KB_ERROR = str(error)
+    print(f"知识库未加载，将使用纯 LLM 模式：{KB_ERROR[:180]}")
 
 
 def get_aime_llm_headers() -> Dict[str, str]:
@@ -277,14 +284,22 @@ def format_context(results: List[Dict]) -> str:
 
 
 def gis_tutor(question: str) -> Tuple[str, str]:
-    results = KB.search(question, TOP_K)
+    results = KB.search(question, TOP_K) if KB_AVAILABLE else []
     context = format_context(results)
+    if results:
+        prompt = f"请基于以下教材片段回答学生的 GIS/虚拟地理环境实验操作问题。\n\n教材片段：\n{context}\n\n学生问题：{question}\n\n请输出：直接回答、分步操作、注意事项、对应章节。"
+    else:
+        prompt = f"当前未加载教材知识库，请结合 GIS 专业知识回答学生问题，并明确说明这是通用 GIS 建议，不是教材原文。\n\n学生问题：{question}\n\n请输出：直接回答、分步操作、注意事项。"
     messages = [
         {"role": "system", "content": SYSTEM_STYLE},
-        {"role": "user", "content": f"请基于以下教材片段回答学生的 GIS/虚拟地理环境实验操作问题。\n\n教材片段：\n{context}\n\n学生问题：{question}\n\n请输出：直接回答、分步操作、注意事项、对应章节。"},
+        {"role": "user", "content": prompt},
     ]
     answer = call_llm(messages)
+    if not answer:
+        answer = "当前大模型服务暂不可用。请稍后重试，或补充所用 GIS 软件、数据格式和具体报错信息。"
     citations = "\n\n".join([f"{i}. {r['heading']}（{r['source']}，相关度 {r['score']:.3f}）" for i, r in enumerate(results, 1)])
+    if not results:
+        citations = "教材知识库尚未构建，当前回答基于通用 GIS 知识。"
     return answer, citations
 
 
