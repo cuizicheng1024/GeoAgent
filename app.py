@@ -2,6 +2,9 @@ import os
 import re
 import json
 import pickle
+import threading
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -14,18 +17,9 @@ for _proxy_key in ("no_proxy", "NO_PROXY"):
 import gradio as gr
 import numpy as np
 import requests
-from docx import Document
 from openai import OpenAI
 
-try:
-    import faiss  # type: ignore
-except Exception:
-    faiss = None
-
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:
-    SentenceTransformer = None
+faiss = None
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -71,21 +65,20 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def is_heading(paragraph) -> bool:
-    style = paragraph.style.name if paragraph.style else ""
-    text = paragraph.text.strip()
+def is_heading_text(text: str, style_name: str = "") -> bool:
     if not text:
         return False
-    if style.startswith("Heading") or style.startswith("标题"):
+    if style_name.startswith("Heading") or style_name.startswith("标题"):
         return True
     return bool(re.match(r"^(第[一二三四五六七八九十0-9]+[章节篇]|\d+(\.\d+){0,3}\s+|[一二三四五六七八九十]+、)", text))
 
 
 def extract_docx_blocks(path: Path) -> List[Dict]:
+    """流式读取 document.xml，跳过图片和其他二进制资源。"""
     if not path.exists():
         raise FileNotFoundError(f"未找到教材文件：{path}")
 
-    doc = Document(str(path))
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     blocks = []
     current_heading = "教材正文"
     buffer = []
@@ -97,15 +90,21 @@ def extract_docx_blocks(path: Path) -> List[Dict]:
             blocks.append({"heading": current_heading, "text": content, "source": path.name})
         buffer = []
 
-    for p in doc.paragraphs:
-        text = clean_text(p.text)
-        if not text:
-            continue
-        if is_heading(p):
-            flush()
-            current_heading = text[:120]
-        else:
-            buffer.append(text)
+    with zipfile.ZipFile(path) as archive:
+        with archive.open("word/document.xml") as xml_file:
+            for event, elem in ET.iterparse(xml_file, events=("end",)):
+                if elem.tag != ns + "p":
+                    continue
+                text = clean_text("".join(node.text or "" for node in elem.iter(ns + "t")))
+                style_node = elem.find(f"{ns}pPr/{ns}pStyle")
+                style_name = style_node.get(ns + "val", "") if style_node is not None else ""
+                if text:
+                    if is_heading_text(text, style_name):
+                        flush()
+                        current_heading = text[:120]
+                    else:
+                        buffer.append(text)
+                elem.clear()
     flush()
     return blocks
 
@@ -137,39 +136,17 @@ class EmbeddingEngine:
         self.openai_client = None
 
     def fit_transform(self, texts: List[str]) -> np.ndarray:
-        if EMBEDDING_BACKEND in {"auto", "openai", "text-embedding-3-small"} and os.getenv("OPENAI_API_KEY"):
-            self.backend = "openai"
-            self.openai_client = OpenAI()
-            return self._openai_embed(texts)
-
-        if EMBEDDING_BACKEND in {"auto", "sentence-transformers", "sbert"} and SentenceTransformer is not None:
-            self.backend = "sentence-transformers"
-            model_name = os.getenv("SENTENCE_TRANSFORMER_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
-            self.model = SentenceTransformer(model_name)
-            return np.asarray(self.model.encode(texts, normalize_embeddings=True), dtype="float32")
-
         if TfidfVectorizer is None:
-            raise RuntimeError("缺少 embedding 后端：请安装 sentence-transformers 或 scikit-learn，或配置 OPENAI_API_KEY 使用 OpenAI embedding。")
+            raise RuntimeError("缺少 scikit-learn，无法构建 TF-IDF 索引。")
         self.backend = "tfidf"
-        self.vectorizer = TfidfVectorizer(max_features=12000, ngram_range=(1, 2))
-        matrix = self.vectorizer.fit_transform(texts).astype("float32")
+        self.vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 2), dtype=np.float32)
+        matrix = self.vectorizer.fit_transform(texts)
         return matrix.toarray()
 
     def transform(self, texts: List[str]) -> np.ndarray:
-        if self.backend == "openai":
-            return self._openai_embed(texts)
-        if self.backend == "sentence-transformers":
-            return np.asarray(self.model.encode(texts, normalize_embeddings=True), dtype="float32")
         if self.backend == "tfidf":
             return self.vectorizer.transform(texts).astype("float32").toarray()
         raise RuntimeError("EmbeddingEngine 尚未初始化。")
-
-    def _openai_embed(self, texts: List[str]) -> np.ndarray:
-        response = self.openai_client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=texts)
-        vecs = [item.embedding for item in response.data]
-        arr = np.asarray(vecs, dtype="float32")
-        norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
-        return arr / norms
 
 
 class KnowledgeBase:
@@ -234,12 +211,25 @@ class KnowledgeBase:
 KB = KnowledgeBase()
 KB_AVAILABLE = False
 KB_ERROR = ""
-try:
-    KB.build(force=os.getenv("REBUILD_INDEX", "0") == "1")
-    KB_AVAILABLE = True
-except Exception as error:
-    KB_ERROR = str(error)
-    print(f"知识库未加载，将使用纯 LLM 模式：{KB_ERROR[:180]}")
+KB_LOCK = threading.Lock()
+
+
+def ensure_kb() -> bool:
+    """首次需要教材检索时才加载或构建索引，避免阻塞 Web 服务启动。"""
+    global KB_AVAILABLE, KB_ERROR
+    if KB_AVAILABLE:
+        return True
+    with KB_LOCK:
+        if KB_AVAILABLE:
+            return True
+        try:
+            KB.build(force=False)
+            KB_AVAILABLE = True
+            KB_ERROR = ""
+        except Exception as error:
+            KB_ERROR = str(error)
+            print(f"知识库加载失败，将使用纯 LLM 模式：{KB_ERROR[:180]}")
+    return KB_AVAILABLE
 
 
 def get_aime_llm_headers() -> Dict[str, str]:
@@ -284,7 +274,7 @@ def format_context(results: List[Dict]) -> str:
 
 
 def gis_tutor(question: str) -> Tuple[str, str]:
-    results = KB.search(question, TOP_K) if KB_AVAILABLE else []
+    results = KB.search(question, TOP_K) if ensure_kb() else []
     context = format_context(results)
     if results:
         prompt = f"请基于以下教材片段回答学生的 GIS/虚拟地理环境实验操作问题。\n\n教材片段：\n{context}\n\n学生问题：{question}\n\n请输出：直接回答、分步操作、注意事项、对应章节。"
@@ -364,7 +354,7 @@ def build_ui():
                 ask_btn = gr.Button("生成回答", variant="primary")
                 ans = gr.Markdown(label="回答")
                 with gr.Accordion("教材依据", open=False):
-                    cite = gr.Textbox(label="命中的教材章节", lines=5, show_copy_button=True)
+                    cite = gr.Textbox(label="命中的教材章节", lines=5)
                 ask_btn.click(gis_tutor, inputs=q, outputs=[ans, cite])
 
             with gr.Tab("问题建模"):
@@ -384,4 +374,5 @@ def build_ui():
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")))
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port)
